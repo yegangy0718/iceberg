@@ -97,8 +97,15 @@ class DataStatisticsOperator<T, K> extends AbstractStreamOperator<DataStatistics
   }
 
   @Override
+  @SuppressWarnings("unchecked")
   public void handleOperatorEvent(OperatorEvent evt) {
     // TODO: receive event with aggregated statistics from coordinator and update globalStatistics
+    if (evt instanceof DataDistributionWeightEvent) {
+      globalStatistics = ((DataDistributionWeightEvent<K>) evt).dataStatistics();
+      output.collect(new StreamRecord<>(DataStatisticsOrRecord.fromDataStatistics(globalStatistics)));
+    } else {
+      throw new IllegalStateException("Received unexpected operator event " + evt);
+    }
   }
 
   @Override
@@ -128,10 +135,18 @@ class DataStatisticsOperator<T, K> extends AbstractStreamOperator<DataStatistics
 
     // TODO: send to coordinator
     // For now we make it simple to send globalStatisticsState at checkpoint
+//    sendDataStatisticToCoordinator(new DataStatisticsEvent<>(checkpointId,
+//            localStatistics));
+    operatorEventGateway.sendEventToCoordinator(new DataStatisticsEvent<>(checkpointId,
+            localStatistics));
 
     // Recreate the local statistics
     localStatistics = statisticsFactory.createDataStatistics();
   }
+
+//  private void sendDataStatisticToCoordinator(OperatorEvent event) {
+//    operatorEventGateway.sendEventToCoordinator(event);
+//  }
 
   @VisibleForTesting
   DataStatistics<K> localDataStatistics() {
