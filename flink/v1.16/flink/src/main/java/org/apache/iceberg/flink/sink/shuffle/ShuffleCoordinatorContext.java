@@ -25,6 +25,7 @@ import java.util.concurrent.TimeUnit;
 import org.apache.flink.runtime.operators.coordination.OperatorCoordinator;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkRuntimeException;
+import org.apache.iceberg.flink.sink.shuffle.statistics.DataStatistics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -56,17 +57,17 @@ public class ShuffleCoordinatorContext<K> implements AutoCloseable {
         coordinatorExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
     }
 
-    void sendDataDistributionWeightToSubtasks(DataDistributionWeight<K> dataDistributionWeight) {
+    void sendDataDistributionWeightToSubtasks(long checkpointId, DataStatistics<K> globalDataStatistics) {
         callInCoordinatorThread(
                 () -> {
-                    DataDistributionWeightEvent<K> dataDistributionWeightEvent =
-                            new DataDistributionWeightEvent<K>(dataDistributionWeight);
+                    DataStatisticsEvent<K> dataStatisticsEvent =
+                            new DataStatisticsEvent<K>(checkpointId, globalDataStatistics);
                     for (final OperatorCoordinator.SubtaskGateway subtaskGateway : subtaskGateways) {
-                        subtaskGateway.sendEvent(dataDistributionWeightEvent);
+                        subtaskGateway.sendEvent(dataStatisticsEvent);
                     }
                     return null;
                 },
-                String.format("Failed to send data distribution weight %s", dataDistributionWeight));
+                String.format("Failed to send global data distribution weight %s for checkpoint %d", globalDataStatistics, checkpointId));
     }
 
     int currentParallelism() {

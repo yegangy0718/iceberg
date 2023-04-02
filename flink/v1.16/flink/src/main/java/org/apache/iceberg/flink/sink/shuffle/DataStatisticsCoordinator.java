@@ -57,8 +57,8 @@ class DataStatisticsCoordinator<K> implements OperatorCoordinator {
   // to keep based on checkpoint
   private final int maxAggregateDataDistributionHistoryToKeep;
   // key is the checkpoint id, value is the DataDistributionWeight at the corresponding checkpoint
-  private final SortedMap<Long, DataDistributionWeight<K>> aggregateDataStatisticsMap = new TreeMap<>();
-  private volatile DataDistributionWeight<K> dataDistributionWeight;
+  private final SortedMap<Long, AggregatedDataStatistics<K>> aggregatedDataStatisticsMap = new TreeMap<>();
+  private volatile AggregatedDataStatistics<K> latestAggregatedDataStatistics;
   // A flag marking whether the coordinator has started
   private final DataStatisticsFactory<K> statisticsFactory;
   private boolean started;
@@ -131,29 +131,29 @@ class DataStatisticsCoordinator<K> implements OperatorCoordinator {
   private void handleDataStatisticRequest(int subtask, DataStatisticsEvent<K> event) {
     long checkpointId = event.checkpointId();
 
-    aggregateDataStatisticsMap.putIfAbsent(checkpointId, new DataDistributionWeight<>(checkpointId, statisticsFactory));
-    aggregateDataStatisticsMap.get(checkpointId).addDataStatisticEvent(subtask, event);
+    aggregatedDataStatisticsMap.putIfAbsent(checkpointId, new AggregatedDataStatistics<>(checkpointId, statisticsFactory));
+    aggregatedDataStatisticsMap.get(checkpointId).mergeDataStatistic(subtask, event);
 
-    if (aggregateDataStatisticsMap.get(checkpointId).aggregatedSize() == context.currentParallelism()) {
-      if (dataDistributionWeight == null || checkpointId >= dataDistributionWeight.checkpointId()) {
-        DataDistributionWeight<K> newDataDistributionWeight = aggregateDataStatisticsMap.get(checkpointId);
-        if (!newDataDistributionWeight.dataStatistics().isEmpty()) {
-          dataDistributionWeight = newDataDistributionWeight;
-          context.sendDataDistributionWeightToSubtasks(dataDistributionWeight);
+    if (aggregatedDataStatisticsMap.get(checkpointId).aggregatedSize() == context.currentParallelism()) {
+      if (latestAggregatedDataStatistics == null || checkpointId >= latestAggregatedDataStatistics.checkpointId()) {
+        AggregatedDataStatistics<K> newAggregatedDataStatistics = aggregatedDataStatisticsMap.get(checkpointId);
+        if (!newAggregatedDataStatistics.dataStatistics().isEmpty()) {
+          latestAggregatedDataStatistics = newAggregatedDataStatistics;
+          context.sendDataDistributionWeightToSubtasks(checkpointId, latestAggregatedDataStatistics.dataStatistics());
         }
       }
 
-      // Clean up all the aggregateDataStatistics whose checkpoint is  <= current checkpoint
-      Map<Long, DataDistributionWeight<K>> toBeCleaned =  aggregateDataStatisticsMap
+      // Clean up all the aggregateDataStatistics whose checkpoint is  <= latest checkpoint
+      Map<Long, AggregatedDataStatistics<K>> toBeCleaned =  aggregatedDataStatisticsMap
               .headMap(checkpointId + 1);
-      aggregateDataStatisticsMap.keySet().removeAll(toBeCleaned.keySet());
+      aggregatedDataStatisticsMap.keySet().removeAll(toBeCleaned.keySet());
     }
 
     // If aggregateDataStatisticsMap contains more than maxAggregateDataDistributionHistoryToKeep entries, remove them
-    int toBeCleanedEntrySize = aggregateDataStatisticsMap.size() - maxAggregateDataDistributionHistoryToKeep;
+    int toBeCleanedEntrySize = aggregatedDataStatisticsMap.size() - maxAggregateDataDistributionHistoryToKeep;
     if (toBeCleanedEntrySize > 0) {
-      Arrays.asList(aggregateDataStatisticsMap.keySet().toArray(new Long[0]))
-              .subList(0, toBeCleanedEntrySize).forEach(aggregateDataStatisticsMap::remove);
+      Arrays.asList(aggregatedDataStatisticsMap.keySet().toArray(new Long[0]))
+              .subList(0, toBeCleanedEntrySize).forEach(aggregatedDataStatisticsMap::remove);
     }
   }
 
@@ -181,18 +181,18 @@ class DataStatisticsCoordinator<K> implements OperatorCoordinator {
   public void checkpointCoordinator(long checkpointId, CompletableFuture<byte[]> resultFuture) throws Exception {
     runInCoordinatorThread(
             () -> {
-              LOG.debug("Taking a state snapshot on shuffle coordinator {} for checkpoint {}",
+              LOG.debug("Taking a state snapshot on data statistics coordinator {} for checkpoint {}",
                       operatorName, checkpointId);
               try {
                 byte[] serializedDataDistributionWeight = InstantiationUtil
-                        .serializeObject(dataDistributionWeight);
+                        .serializeObject(latestAggregatedDataStatistics);
                 resultFuture.complete(serializedDataDistributionWeight);
               } catch (Throwable e) {
                 ExceptionUtils.rethrowIfFatalErrorOrOOM(e);
                 resultFuture.completeExceptionally(
                         new CompletionException(
                                 String.format(
-                                        "Failed to checkpoint data statistics for shuffle coordinator %s",
+                                        "Failed to checkpoint data statistics for data statistics coordinator %s",
                                         operatorName),
                                 e));
               }
@@ -222,7 +222,7 @@ class DataStatisticsCoordinator<K> implements OperatorCoordinator {
     }
 
     LOG.info("Restoring data statistic weights of shuffle {} from checkpoint.", operatorName);
-    dataDistributionWeight = InstantiationUtil.deserializeObject(checkpointData, Map.class.getClassLoader());
+    latestAggregatedDataStatistics = InstantiationUtil.deserializeObject(checkpointData, AggregatedDataStatistics.class.getClassLoader());
   }
 
   @Override
@@ -242,13 +242,13 @@ class DataStatisticsCoordinator<K> implements OperatorCoordinator {
 
   // ---------------------------------------------------
   @VisibleForTesting
-  DataDistributionWeight<K> dataDistributionWeight() {
-    return dataDistributionWeight;
+  AggregatedDataStatistics<K> latestAggregatedDataStatistics() {
+    return latestAggregatedDataStatistics;
   }
 
   @VisibleForTesting
-  SortedMap<Long, DataDistributionWeight<K>> aggregateDataStatisticsMap() {
-    return aggregateDataStatisticsMap;
+  SortedMap<Long, AggregatedDataStatistics<K>> aggregateDataStatisticsMap() {
+    return aggregatedDataStatisticsMap;
   }
 
   @VisibleForTesting
