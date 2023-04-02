@@ -100,8 +100,8 @@ class DataStatisticsOperator<T, K> extends AbstractStreamOperator<DataStatistics
   @SuppressWarnings("unchecked")
   public void handleOperatorEvent(OperatorEvent evt) {
     // TODO: receive event with aggregated statistics from coordinator and update globalStatistics
-    if (evt instanceof DataDistributionWeightEvent) {
-      globalStatistics = ((DataDistributionWeightEvent<K>) evt).dataStatistics();
+    if (evt instanceof DataStatisticsEvent) {
+      globalStatistics = ((DataStatisticsEvent<K>) evt).dataStatistics();
       output.collect(new StreamRecord<>(DataStatisticsOrRecord.fromDataStatistics(globalStatistics)));
     } else {
       throw new IllegalStateException("Received unexpected operator event " + evt);

@@ -19,21 +19,19 @@
 package org.apache.iceberg.flink.sink.shuffle;
 
 import java.io.Serializable;
-import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.flink.sink.shuffle.statistics.DataStatistics;
 import org.apache.iceberg.flink.sink.shuffle.statistics.DataStatisticsFactory;
 
-class DataDistributionWeight<K> implements Serializable {
+class AggregatedDataStatistics<K> implements Serializable {
 
     private final long checkpointId;
     private final DataStatisticsFactory<K> statisticsFactory;
     private final DataStatistics<K> dataStatistics;
     private final Set<Integer> subtaskSet = new HashSet<>();
 
-    DataDistributionWeight(long checkpoint, final DataStatisticsFactory<K> statisticsFactory) {
+    AggregatedDataStatistics(long checkpoint, final DataStatisticsFactory<K> statisticsFactory) {
         this.checkpointId = checkpoint;
         this.statisticsFactory = statisticsFactory;
         this.dataStatistics = statisticsFactory.createDataStatistics();
@@ -47,7 +45,7 @@ class DataDistributionWeight<K> implements Serializable {
         return dataStatistics;
     }
 
-    void addDataStatisticEvent(int subtask, DataStatisticsEvent<K> event) {
+    void mergeDataStatistic(int subtask, DataStatisticsEvent<K> event) {
         if (!subtaskSet.add(subtask)) {
             return;
         }
