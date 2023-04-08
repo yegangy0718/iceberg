@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.flink.sink.shuffle.statistics;
 
+import java.io.Serializable;
 import org.apache.flink.annotation.Internal;
 
 /**
@@ -28,7 +29,7 @@ import org.apache.flink.annotation.Internal;
  * (sketching) can be used.
  */
 @Internal
-public interface DataStatistics<K> {
+public interface DataStatistics<K> extends Serializable {
 
   /**
    * Check if data statistics contains any statistics information

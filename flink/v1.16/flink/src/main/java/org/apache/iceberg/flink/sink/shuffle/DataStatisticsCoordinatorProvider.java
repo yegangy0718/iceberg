@@ -31,76 +31,82 @@ import org.apache.flink.util.FatalExitExceptionHandler;
 import org.apache.iceberg.flink.sink.shuffle.statistics.DataStatisticsFactory;
 import org.jetbrains.annotations.NotNull;
 
-public class DataStatisticsCoordinatorProvider<K extends Serializable> extends RecreateOnResetOperatorCoordinator.Provider {
+public class DataStatisticsCoordinatorProvider<K extends Serializable>
+    extends RecreateOnResetOperatorCoordinator.Provider {
 
-    private final String operatorName;
-    private final DataStatisticsFactory<K> dataStatisticsFactory;
-    private final int maxAggregatedDataDistributionHistoryToKeep;
+  private final String operatorName;
+  private final DataStatisticsFactory<K> dataStatisticsFactory;
+  private final int maxAggregatedDataDistributionHistoryToKeep;
 
-    public DataStatisticsCoordinatorProvider(String operatorName,
-                                             OperatorID operatorID,
-                                             DataStatisticsFactory<K> dataStatisticsFactory,
-                                             int maxAggregatedDataDistributionHistoryToKeep) {
-        super(operatorID);
-        this.operatorName = operatorName;
-        this.dataStatisticsFactory = dataStatisticsFactory;
-        this.maxAggregatedDataDistributionHistoryToKeep = maxAggregatedDataDistributionHistoryToKeep;
+  public DataStatisticsCoordinatorProvider(
+      String operatorName,
+      OperatorID operatorID,
+      DataStatisticsFactory<K> dataStatisticsFactory,
+      int maxAggregatedDataDistributionHistoryToKeep) {
+    super(operatorID);
+    this.operatorName = operatorName;
+    this.dataStatisticsFactory = dataStatisticsFactory;
+    this.maxAggregatedDataDistributionHistoryToKeep = maxAggregatedDataDistributionHistoryToKeep;
+  }
+
+  @Override
+  public OperatorCoordinator getCoordinator(OperatorCoordinator.Context context) {
+    DataStatisticsCoordinatorProvider.CoordinatorExecutorThreadFactory coordinatorThreadFactory =
+        new DataStatisticsCoordinatorProvider.CoordinatorExecutorThreadFactory(
+            "DataStatisticsCoordinator-" + operatorName, context.getUserCodeClassloader());
+    ExecutorService coordinatorExecutor =
+        Executors.newSingleThreadExecutor(coordinatorThreadFactory);
+    DataStatisticsCoordinatorContext<K> dataStatisticsCoordinatorContext =
+        new DataStatisticsCoordinatorContext<>(
+            coordinatorExecutor, coordinatorThreadFactory, context);
+
+    return new DataStatisticsCoordinator<>(
+        operatorName,
+        coordinatorExecutor,
+        dataStatisticsCoordinatorContext,
+        dataStatisticsFactory,
+        maxAggregatedDataDistributionHistoryToKeep);
+  }
+
+  static class CoordinatorExecutorThreadFactory
+      implements ThreadFactory, Thread.UncaughtExceptionHandler {
+
+    private final String coordinatorThreadName;
+    private final ClassLoader classLoader;
+    private final Thread.UncaughtExceptionHandler errorHandler;
+
+    @Nullable private Thread thread;
+
+    CoordinatorExecutorThreadFactory(
+        final String coordinatorThreadName, final ClassLoader contextClassLoader) {
+      this(coordinatorThreadName, contextClassLoader, FatalExitExceptionHandler.INSTANCE);
+    }
+
+    @VisibleForTesting
+    CoordinatorExecutorThreadFactory(
+        final String coordinatorThreadName,
+        final ClassLoader contextClassLoader,
+        final Thread.UncaughtExceptionHandler errorHandler) {
+      this.coordinatorThreadName = coordinatorThreadName;
+      this.classLoader = contextClassLoader;
+      this.errorHandler = errorHandler;
     }
 
     @Override
-    public OperatorCoordinator getCoordinator(OperatorCoordinator.Context context) {
-        DataStatisticsCoordinatorProvider.CoordinatorExecutorThreadFactory coordinatorThreadFactory =
-                new DataStatisticsCoordinatorProvider.CoordinatorExecutorThreadFactory(
-                        "ShuffleCoordinator-" + operatorName, context.getUserCodeClassloader());
-        ExecutorService coordinatorExecutor =
-                Executors.newSingleThreadExecutor(coordinatorThreadFactory);
-        ShuffleCoordinatorContext<K> shuffleCoordinatorContext =
-                new ShuffleCoordinatorContext<>(coordinatorExecutor, coordinatorThreadFactory, context);
-
-        return new DataStatisticsCoordinator<>(operatorName, coordinatorExecutor, shuffleCoordinatorContext, dataStatisticsFactory,
-                maxAggregatedDataDistributionHistoryToKeep);
+    public synchronized Thread newThread(@NotNull Runnable runnable) {
+      thread = new Thread(runnable, coordinatorThreadName);
+      thread.setContextClassLoader(classLoader);
+      thread.setUncaughtExceptionHandler(this);
+      return thread;
     }
 
-    static class CoordinatorExecutorThreadFactory
-            implements ThreadFactory, Thread.UncaughtExceptionHandler {
-
-        private final String coordinatorThreadName;
-        private final ClassLoader cl;
-        private final Thread.UncaughtExceptionHandler errorHandler;
-
-        @Nullable
-        private Thread thread;
-
-        CoordinatorExecutorThreadFactory(
-                final String coordinatorThreadName, final ClassLoader contextClassLoader) {
-            this(coordinatorThreadName, contextClassLoader, FatalExitExceptionHandler.INSTANCE);
-        }
-
-        @VisibleForTesting
-        CoordinatorExecutorThreadFactory(
-                final String coordinatorThreadName,
-                final ClassLoader contextClassLoader,
-                final Thread.UncaughtExceptionHandler errorHandler) {
-            this.coordinatorThreadName = coordinatorThreadName;
-            this.cl = contextClassLoader;
-            this.errorHandler = errorHandler;
-        }
-
-        @Override
-        public synchronized Thread newThread(@NotNull Runnable r) {
-            thread = new Thread(r, coordinatorThreadName);
-            thread.setContextClassLoader(cl);
-            thread.setUncaughtExceptionHandler(this);
-            return thread;
-        }
-
-        @Override
-        public synchronized void uncaughtException(Thread t, Throwable e) {
-            errorHandler.uncaughtException(t, e);
-        }
-
-        boolean isCurrentThreadCoordinatorThread() {
-            return Thread.currentThread() == thread;
-        }
+    @Override
+    public synchronized void uncaughtException(Thread t, Throwable e) {
+      errorHandler.uncaughtException(t, e);
     }
+
+    boolean isCurrentThreadCoordinatorThread() {
+      return Thread.currentThread() == thread;
+    }
+  }
 }

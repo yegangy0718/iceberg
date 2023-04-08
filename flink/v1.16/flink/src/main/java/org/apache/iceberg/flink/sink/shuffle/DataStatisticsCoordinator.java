@@ -27,7 +27,6 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.apache.flink.runtime.operators.coordination.OperatorCoordinator;
-
 import org.apache.flink.runtime.operators.coordination.OperatorEvent;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkException;
@@ -41,39 +40,45 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * DataStatisticsOperator collects traffic distribution statistics. A custom partitioner shall be
- * attached to the DataStatisticsOperator output. The custom partitioner leverages the statistics to
- * shuffle record to improve data clustering while maintaining relative balanced traffic
- * distribution to downstream subtasks.
+ * DataStatisticsCoordinator receives {@link DataStatisticsEvent} from {@link
+ * DataStatisticsOperator} every subtask and then merge them together. Once aggregation for all
+ * subtasks data statistics completes, DataStatisticsCoordinator will send the aggregation
+ * result(global data statistics) back to {@link DataStatisticsOperator}. In the end a custom
+ * partitioner will distribute traffic based on the global data statistics to improve data
+ * clustering.
  */
 class DataStatisticsCoordinator<K> implements OperatorCoordinator {
   private static final Logger LOG = LoggerFactory.getLogger(DataStatisticsCoordinator.class);
 
   private final String operatorName;
-  // A single-thread executor to handle all the changes to the coordinator
+  // A single-thread executor to handle all the actions for coordinator
   private final ExecutorService coordinatorExecutor;
-  private final ShuffleCoordinatorContext<K> context;
+  private final DataStatisticsCoordinatorContext<K> context;
   // The max size for aggregateDataStatisticsMap which is the max aggregateDataStatistics history
   // to keep based on checkpoint
   private final int maxAggregateDataDistributionHistoryToKeep;
-  // key is the checkpoint id, value is the DataDistributionWeight at the corresponding checkpoint
-  private final SortedMap<Long, AggregatedDataStatistics<K>> aggregatedDataStatisticsMap = new TreeMap<>();
-  private volatile AggregatedDataStatistics<K> latestAggregatedDataStatistics;
-  // A flag marking whether the coordinator has started
+  // key is the checkpoint id, value is the AggregatedDataStatistics at the corresponding checkpoint
+  private final SortedMap<Long, AggregatedDataStatistics<K>> pendingAggregatedDataStatisticsMap =
+      new TreeMap<>();
+  // the latest AggregatedDataStatistics which is sent to operators
+  private volatile AggregatedDataStatistics<K> completedAggregatedDataStatistics;
   private final DataStatisticsFactory<K> statisticsFactory;
   private boolean started;
 
-  public DataStatisticsCoordinator(String operatorName,
-                            ExecutorService coordinatorExecutor,
-                            ShuffleCoordinatorContext<K> context,
-                                   DataStatisticsFactory<K> statisticsFactory,
-                            int maxAggregateDataDistributionHistoryToKeep) {
+  public DataStatisticsCoordinator(
+      String operatorName,
+      ExecutorService coordinatorExecutor,
+      DataStatisticsCoordinatorContext<K> context,
+      DataStatisticsFactory<K> statisticsFactory,
+      int maxAggregateDataDistributionHistoryToKeep) {
     this.operatorName = operatorName;
     this.coordinatorExecutor = coordinatorExecutor;
     this.context = context;
     this.statisticsFactory = statisticsFactory;
-    Preconditions.checkArgument(maxAggregateDataDistributionHistoryToKeep > 0,
-            "maxAggregateDataDistributionHistoryToKeep %d must be positive", maxAggregateDataDistributionHistoryToKeep);
+    Preconditions.checkArgument(
+        maxAggregateDataDistributionHistoryToKeep > 0,
+        "maxAggregateDataDistributionHistoryToKeep %d must be positive",
+        maxAggregateDataDistributionHistoryToKeep);
     this.maxAggregateDataDistributionHistoryToKeep = maxAggregateDataDistributionHistoryToKeep;
   }
 
@@ -98,113 +103,120 @@ class DataStatisticsCoordinator<K> implements OperatorCoordinator {
     }
   }
 
-  private void ensureStarted() {
-    if (!started) {
-      throw new IllegalStateException("The coordinator has not started yet.");
-    }
-  }
-
-  private void runInCoordinatorThread(final ThrowingRunnable<Throwable> action,
-                                      final String actionName,
-                                      final Object... actionNameFormatParameters) {
+  private void runInCoordinatorThread(
+      final ThrowingRunnable<Throwable> action,
+      final String actionName,
+      final Object... actionNameFormatParameters) {
     ensureStarted();
     coordinatorExecutor.execute(
-            () -> {
-              try {
-                action.run();
-              } catch (Throwable t) {
-                // if we have a JVM critical error, promote it immediately, there is a good
-                // chance the logging or job failing will not succeed anymore
-                ExceptionUtils.rethrowIfFatalErrorOrOOM(t);
+        () -> {
+          try {
+            action.run();
+          } catch (Throwable t) {
+            // if we have a JVM critical error, promote it immediately, there is a good
+            // chance the logging or job failing will not succeed anymore
+            ExceptionUtils.rethrowIfFatalErrorOrOOM(t);
 
-                final String actionString = String.format(actionName, actionNameFormatParameters);
-                LOG.error(
-                        "Uncaught exception in the shuffle coordinator for operator {} while {}. Triggering job failover.",
-                        operatorName,
-                        actionString,
-                        t);
-                context.failJob(t);
-              }
-            });
+            final String actionString = String.format(actionName, actionNameFormatParameters);
+            LOG.error(
+                "Uncaught exception in the data statistics coordinator for operator {} while {}. Triggering job failover.",
+                operatorName,
+                actionString,
+                t);
+            context.failJob(t);
+          }
+        });
+  }
+
+  private void ensureStarted() {
+    if (!this.started) {
+      throw new IllegalStateException("The coordinator has not started yet.");
+    }
   }
 
   private void handleDataStatisticRequest(int subtask, DataStatisticsEvent<K> event) {
     long checkpointId = event.checkpointId();
 
-    aggregatedDataStatisticsMap.putIfAbsent(checkpointId, new AggregatedDataStatistics<>(checkpointId, statisticsFactory));
-    aggregatedDataStatisticsMap.get(checkpointId).mergeDataStatistic(subtask, event);
+    pendingAggregatedDataStatisticsMap.putIfAbsent(
+        checkpointId, new AggregatedDataStatistics<>(checkpointId, statisticsFactory));
+    pendingAggregatedDataStatisticsMap.get(checkpointId).mergeDataStatistic(subtask, event);
 
-    if (aggregatedDataStatisticsMap.get(checkpointId).aggregatedSize() == context.currentParallelism()) {
-      if (latestAggregatedDataStatistics == null || checkpointId >= latestAggregatedDataStatistics.checkpointId()) {
-        AggregatedDataStatistics<K> newAggregatedDataStatistics = aggregatedDataStatisticsMap.get(checkpointId);
-        if (!newAggregatedDataStatistics.dataStatistics().isEmpty()) {
-          latestAggregatedDataStatistics = newAggregatedDataStatistics;
-          context.sendDataDistributionWeightToSubtasks(checkpointId, latestAggregatedDataStatistics.dataStatistics());
+    if (pendingAggregatedDataStatisticsMap.get(checkpointId).aggregatedSize()
+        == context.currentParallelism()) {
+      if (completedAggregatedDataStatistics == null
+          || checkpointId >= completedAggregatedDataStatistics.checkpointId()) {
+        AggregatedDataStatistics<K> newCompletedAggregatedDataStatistics =
+            pendingAggregatedDataStatisticsMap.get(checkpointId);
+        if (!newCompletedAggregatedDataStatistics.dataStatistics().isEmpty()) {
+          completedAggregatedDataStatistics = newCompletedAggregatedDataStatistics;
+          context.sendDataStatisticsToSubtasks(
+              checkpointId, completedAggregatedDataStatistics.dataStatistics());
         }
       }
 
-      // Clean up all the aggregateDataStatistics whose checkpoint is  <= latest checkpoint
-      Map<Long, AggregatedDataStatistics<K>> toBeCleaned =  aggregatedDataStatisticsMap
-              .headMap(checkpointId + 1);
-      aggregatedDataStatisticsMap.keySet().removeAll(toBeCleaned.keySet());
+      // Clean up all the aggregateDataStatistics whose checkpoint is  <= completed aggregated
+      // checkpoint
+      Map<Long, AggregatedDataStatistics<K>> toBeCleaned =
+          pendingAggregatedDataStatisticsMap.headMap(checkpointId + 1);
+      pendingAggregatedDataStatisticsMap.keySet().removeAll(toBeCleaned.keySet());
     }
 
-    // If aggregateDataStatisticsMap contains more than maxAggregateDataDistributionHistoryToKeep entries, remove them
-    int toBeCleanedEntrySize = aggregatedDataStatisticsMap.size() - maxAggregateDataDistributionHistoryToKeep;
+    // If aggregateDataStatisticsMap contains more than maxAggregateDataDistributionHistoryToKeep
+    // entries, remove them
+    int toBeCleanedEntrySize =
+        pendingAggregatedDataStatisticsMap.size() - maxAggregateDataDistributionHistoryToKeep;
     if (toBeCleanedEntrySize > 0) {
-      Arrays.asList(aggregatedDataStatisticsMap.keySet().toArray(new Long[0]))
-              .subList(0, toBeCleanedEntrySize).forEach(aggregatedDataStatisticsMap::remove);
+      Arrays.asList(pendingAggregatedDataStatisticsMap.keySet().toArray(new Long[0]))
+          .subList(0, toBeCleanedEntrySize)
+          .forEach(pendingAggregatedDataStatisticsMap::remove);
     }
   }
 
   @Override
   @SuppressWarnings("unchecked")
-  public void handleEventFromOperator(int subtask, int attemptNumber, OperatorEvent event) throws Exception {
+  public void handleEventFromOperator(int subtask, int attemptNumber, OperatorEvent event) {
     runInCoordinatorThread(
-            () -> {
-              LOG.debug("Handling event from subtask {} of {}: {}",
-                      subtask,
-                      operatorName,
-                      event);
-              if (event instanceof DataStatisticsEvent) {
-                handleDataStatisticRequest(subtask, ((DataStatisticsEvent<K>) event));
-              } else {
-                throw new FlinkException("Unrecognized shuffle operator Event: " + event);
-              }
-            },
-            "handling operator event %s from shuffle operator subtask %d",
-            event,
-            subtask);
+        () -> {
+          LOG.debug("Handling event from subtask {} of {}: {}", subtask, operatorName, event);
+          if (event instanceof DataStatisticsEvent) {
+            handleDataStatisticRequest(subtask, ((DataStatisticsEvent<K>) event));
+          } else {
+            throw new FlinkException("Unrecognized data statistics operator event: " + event);
+          }
+        },
+        "handling operator event %s from data statistics operator subtask %d",
+        event,
+        subtask);
   }
 
   @Override
-  public void checkpointCoordinator(long checkpointId, CompletableFuture<byte[]> resultFuture) throws Exception {
+  public void checkpointCoordinator(long checkpointId, CompletableFuture<byte[]> resultFuture) {
     runInCoordinatorThread(
-            () -> {
-              LOG.debug("Taking a state snapshot on data statistics coordinator {} for checkpoint {}",
-                      operatorName, checkpointId);
-              try {
-                byte[] serializedDataDistributionWeight = InstantiationUtil
-                        .serializeObject(latestAggregatedDataStatistics);
-                resultFuture.complete(serializedDataDistributionWeight);
-              } catch (Throwable e) {
-                ExceptionUtils.rethrowIfFatalErrorOrOOM(e);
-                resultFuture.completeExceptionally(
-                        new CompletionException(
-                                String.format(
-                                        "Failed to checkpoint data statistics for data statistics coordinator %s",
-                                        operatorName),
-                                e));
-              }
-            },
-            "taking checkpoint %d",
-            checkpointId);
+        () -> {
+          LOG.debug(
+              "Taking a state snapshot on data statistics coordinator {} for checkpoint {}",
+              operatorName,
+              checkpointId);
+          try {
+            byte[] serializedDataDistributionWeight =
+                InstantiationUtil.serializeObject(completedAggregatedDataStatistics);
+            resultFuture.complete(serializedDataDistributionWeight);
+          } catch (Throwable e) {
+            ExceptionUtils.rethrowIfFatalErrorOrOOM(e);
+            resultFuture.completeExceptionally(
+                new CompletionException(
+                    String.format(
+                        "Failed to checkpoint data statistics for data statistics coordinator %s",
+                        operatorName),
+                    e));
+          }
+        },
+        "taking checkpoint %d",
+        checkpointId);
   }
 
   @Override
-  public void notifyCheckpointComplete(long checkpointId) {
-
-  }
+  public void notifyCheckpointComplete(long checkpointId) {}
 
   @Override
   public void notifyCheckpointAborted(long checkpointId) {
@@ -212,47 +224,82 @@ class DataStatisticsCoordinator<K> implements OperatorCoordinator {
   }
 
   @Override
-  public void resetToCheckpoint(long checkpointId, @Nullable byte[] checkpointData) throws Exception {
+  public void resetToCheckpoint(long checkpointId, @Nullable byte[] checkpointData)
+      throws Exception {
     if (started) {
-      throw new IllegalStateException("The coordinator can only be reset if it was not yet started");
+      throw new IllegalStateException(
+          "The coordinator can only be reset if it was not yet started");
     }
 
     if (checkpointData == null) {
       return;
     }
 
-    LOG.info("Restoring data statistic weights of shuffle {} from checkpoint.", operatorName);
-    latestAggregatedDataStatistics = InstantiationUtil.deserializeObject(checkpointData, AggregatedDataStatistics.class.getClassLoader());
+    LOG.info(
+        "Restoring data statistic coordinator {} from checkpoint {}.", operatorName, checkpointId);
+    completedAggregatedDataStatistics =
+        InstantiationUtil.deserializeObject(
+            checkpointData, AggregatedDataStatistics.class.getClassLoader());
   }
 
   @Override
   public void subtaskReset(int subtask, long checkpointId) {
-
+    this.runInCoordinatorThread(
+        () -> {
+          LOG.info(
+              "Resetting subtask {} to checkpoint {} for data statistics {} to checkpoint.",
+              subtask,
+              checkpointId,
+              this.operatorName);
+          this.context.subtaskReset(subtask);
+        },
+        "handling subtask %d recovery to checkpoint %d",
+        subtask,
+        checkpointId);
   }
 
   @Override
   public void executionAttemptFailed(int subtask, int attemptNumber, @Nullable Throwable reason) {
-
+    this.runInCoordinatorThread(
+        () -> {
+          LOG.info(
+              "Unregistering gateway after failure for subtask {} (#{}) of data statistic {}.",
+              subtask,
+              attemptNumber,
+              this.operatorName);
+          this.context.attemptFailed(subtask, attemptNumber);
+        },
+        "handling subtask %d (#%d) failure",
+        subtask,
+        attemptNumber);
   }
 
   @Override
   public void executionAttemptReady(int subtask, int attemptNumber, SubtaskGateway gateway) {
-
+    Preconditions.checkArgument(subtask == gateway.getSubtask());
+    Preconditions.checkArgument(attemptNumber == gateway.getExecution().getAttemptNumber());
+    this.runInCoordinatorThread(
+        () -> {
+          this.context.attemptReady(gateway);
+        },
+        "making event gateway to subtask %d (#%d) available",
+        subtask,
+        attemptNumber);
   }
 
   // ---------------------------------------------------
   @VisibleForTesting
   AggregatedDataStatistics<K> latestAggregatedDataStatistics() {
-    return latestAggregatedDataStatistics;
+    return completedAggregatedDataStatistics;
   }
 
   @VisibleForTesting
   SortedMap<Long, AggregatedDataStatistics<K>> aggregateDataStatisticsMap() {
-    return aggregatedDataStatisticsMap;
+    return pendingAggregatedDataStatisticsMap;
   }
 
   @VisibleForTesting
-  ShuffleCoordinatorContext<K> context() {
+  DataStatisticsCoordinatorContext<K> context() {
     return context;
   }
 }

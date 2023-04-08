@@ -23,37 +23,41 @@ import java.util.HashSet;
 import java.util.Set;
 import org.apache.iceberg.flink.sink.shuffle.statistics.DataStatistics;
 import org.apache.iceberg.flink.sink.shuffle.statistics.DataStatisticsFactory;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
 class AggregatedDataStatistics<K> implements Serializable {
 
-    private final long checkpointId;
-    private final DataStatisticsFactory<K> statisticsFactory;
-    private final DataStatistics<K> dataStatistics;
-    private final Set<Integer> subtaskSet = new HashSet<>();
+  private final long checkpointId;
+  private final DataStatistics<K> dataStatistics;
+  private final Set<Integer> subtaskSet = new HashSet<>();
 
-    AggregatedDataStatistics(long checkpoint, final DataStatisticsFactory<K> statisticsFactory) {
-        this.checkpointId = checkpoint;
-        this.statisticsFactory = statisticsFactory;
-        this.dataStatistics = statisticsFactory.createDataStatistics();
+  AggregatedDataStatistics(long checkpoint, final DataStatisticsFactory<K> statisticsFactory) {
+    this.checkpointId = checkpoint;
+    this.dataStatistics = statisticsFactory.createDataStatistics();
+  }
+
+  long checkpointId() {
+    return checkpointId;
+  }
+
+  DataStatistics<K> dataStatistics() {
+    return dataStatistics;
+  }
+
+  void mergeDataStatistic(int subtask, DataStatisticsEvent<K> event) {
+    Preconditions.checkArgument(
+        checkpointId == event.checkpointId(),
+        "Received unexpected event from checkpoint %s. Expected checkpoint %s",
+        event.checkpointId(),
+        checkpointId);
+    if (!subtaskSet.add(subtask)) {
+      return;
     }
 
-    long checkpointId() {
-        return checkpointId;
-    }
+    dataStatistics.merge(event.dataStatistics());
+  }
 
-    DataStatistics<K> dataStatistics() {
-        return dataStatistics;
-    }
-
-    void mergeDataStatistic(int subtask, DataStatisticsEvent<K> event) {
-        if (!subtaskSet.add(subtask)) {
-            return;
-        }
-
-        dataStatistics.merge(event.dataStatistics());
-    }
-
-    long aggregatedSize() {
-        return subtaskSet.size();
-    }
+  long aggregatedSize() {
+    return subtaskSet.size();
+  }
 }
